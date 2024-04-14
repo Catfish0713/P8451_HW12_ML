@@ -1,0 +1,207 @@
+---
+title: "P8451_HW12_ML"
+author: "Ruixi Li"
+date: "2024-04-14"
+output: word_document
+---
+
+### Step 1: Load Packages
+
+We will use the matchit package for matching by propensity score and the randomforest within the caret package to generate the propensity score.
+
+
+```{r packages, include=FALSE}
+library(MatchIt)
+library(randomForest)
+library(caret)
+library(tidyverse)
+
+```
+
+### Step 2: Read-in and clean data
+
+For random forest, cannot have any missing data. For illustration purposes, we will conduct a complete-case analysis.
+
+Note that missing data have been denoted by a '.'. So we need to change that to NA and then restrict to complete cases. Also need to convert numeric data to factor where appropriate.
+
+
+```{r data_prep}
+
+nmes_data <- read.delim("nmes_data.txt")
+
+#Restrict to only needed variables
+keep.var<-c("LASTAGE", "MALE", "RACE3", "eversmk", "lc5", "beltuse", "educate", "marital", "SREGION", "POVSTALB")
+nmes.data<-nmes_data[,keep.var]
+
+#Inspect data summaries
+str(nmes.data)
+
+#Recode missings
+nmes.data[nmes.data=="."]<-NA
+
+#Change variable types where appropriate
+nmes.data$MALE <- as.factor(nmes.data$MALE)
+nmes.data$educate <- as.factor(nmes.data$educate)
+nmes.data$RACE3 <- as.factor(nmes.data$RACE3)
+nmes.data$eversmk<-as.factor(nmes.data$eversmk)
+nmes.data$SREGION <- as.factor(nmes.data$SREGION)
+nmes.data$lc5<-as.factor(nmes.data$lc5)
+nmes.data$beltuse<-as.factor(nmes.data$beltuse)
+nmes.data$marital<-as.factor(nmes.data$marital)
+
+nmes.data$POVSTALB<-factor(nmes.data$POVSTALB, order=TRUE)
+
+nmesdata<-na.omit(nmes.data)    
+```
+
+### Step 3: Estimate the Propensity Score using Elastic Net
+
+I'm automating the tuning using both alpha and lambda.
+
+```{r elasticnet}
+set.seed(123)
+control = trainControl(method = "repeatedcv", 
+                      number = 10,
+                      repeats = 5,
+                      selectionFunction = "best")
+set.seed(123)
+
+# Model building
+ps.en<- train(
+                  eversmk ~LASTAGE + MALE + educate + beltuse + POVSTALB + marital + RACE3 + SREGION, 
+                  data=nmesdata, 
+                 method="glmnet", 
+                 metric="Accuracy", 
+                 importance=TRUE,
+                 trControl =  control, 
+                 preProc = c("center", "scale"),
+                 tuneGrid = expand.grid(alpha = seq(0, 1, length = 20), 
+                                         lambda = exp(seq(3, -3, length = 100)))
+                )
+
+#Print the values of alpha and lambda that gave best prediction
+ps.en$bestTune
+
+
+# Model coefficients
+coef(ps.en$finalModel, ps.en$bestTune$lambda)
+
+
+
+# Predictions for models
+prop.score.en = predict(ps.en, nmesdata, type="prob")
+nmesdata$PS.EN <- prop.score.en[,2]
+
+##Using optimal values from tuning above, I'm creating my final model within the actual random forest package. ##Exercise: How would you replicate this using just the caret package?
+
+set.seed(123)
+ps.model.rf<-randomForest(eversmk~LASTAGE + MALE + educate + beltuse + POVSTALB + marital + RACE3 + SREGION, 
+                    data=nmesdata, mtry=3, ntree=500)
+
+#Append predicted probabilities onto original dataset
+ps.rf<-ps.model.rf$votes
+nmesdata$PS.RF<-ps.rf[,2]
+
+
+
+ps.model.logit <- glm(eversmk ~ LASTAGE + MALE + educate + beltuse + POVSTALB + marital + RACE3 + SREGION,
+                      data=nmesdata, 
+                      family=binomial(link="logit"))
+summary(ps.model.logit)
+    
+# estimates odds of eversmoke, then convert to probability (aka the propensity score)
+  prop.score <- (predict(ps.model.logit, nmesdata, type="response"))
+  nmesdata$PS.LOGIT <- prop.score # the logistic regression estimated PS
+  
+  
+  
+#Compare propensity scores
+plot(nmesdata$PS.LOGIT, nmesdata$PS.RF)
+plot(nmesdata$PS.LOGIT, nmesdata$PS.EN)
+plot(nmesdata$PS.EN, nmesdata$PS.RF)
+```
+
+### Examine region of common support
+
+This is common for propensity score analyses, to ensure that there is overlap in propensities among those who were "exposed/treated" and those who were not.
+```{r overlap}
+
+ggplot(data=nmesdata, aes(x=PS.LOGIT))+geom_histogram()+facet_grid(~eversmk)+theme_bw()+ggtitle("Overlap PS from Logistic Regression")
+
+ggplot(data=nmesdata, aes(x=PS.RF))+geom_histogram()+facet_grid(~eversmk)+theme_bw()+ggtitle("Overlap PS from Random Forest")
+
+ggplot(data=nmesdata, aes(x=PS.EN))+geom_histogram()+facet_grid(~eversmk)+theme_bw()+ggtitle("Overlap PS from Elastic Net")
+```
+
+The region where the histograms of both groups overlap is the common support. The Elastic Net PS distribution is similar to that of that of logistic model and shows a more consistent overlap between groups, particularly in the middle range of the scores, although it is slightly skewed to the higher scores. There appears to be less separation between the groups compared to the Random Forest model.
+
+### Step 5: Match by propensity score in 1:1 matching and compare covariate balance and population size
+
+The matchit function matches individuals by "distance". Here, we make our distance the propensity score. We matching to the *nearest* value that is within a *caliper* of 0.2 standard deviations. If there are observations, either exposed or unexposed, without any matches, they are *discarded* from the analysis. The *ratio* of exposed to unexposed in matching is 1.
+
+```{r matching}
+#Creating matching using propensity scores from logistic regression
+  nn1 <- matchit(eversmk ~ LASTAGE + MALE + educate + beltuse + POVSTALB + marital + RACE3 + SREGION, 
+                    data=nmesdata, distance=nmesdata$PS.LOGIT, method="nearest", discard="both", caliper=0.2, 
+                    ratio=1)
+  nn1.data <- match.data(nn1)
+  summary(nn1, standardize=T)
+
+#Creating matching using propensity scores from random forest    
+  nn1.rf <- matchit(eversmk ~ LASTAGE + MALE + educate + beltuse + POVSTALB + marital + RACE3 + SREGION, 
+                    data=nmesdata, distance=nmesdata$PS.RF, method="nearest", discard = "both", caliper=0.2, 
+                    ratio=1)
+      
+  nn1.data.rf <- match.data(nn1.rf)
+  summary(nn1.rf, standardize=T)
+ 
+  
+  #Creating matching using propensity scores from elastic net    
+  nn1.en <- matchit(eversmk ~ LASTAGE + MALE + educate + beltuse + POVSTALB + marital + RACE3 + SREGION, 
+                    data=nmesdata, distance=nmesdata$PS.EN, method="nearest", discard = "both", caliper=0.2, 
+                    ratio=1)
+      
+  nn1.data.en <- match.data(nn1.en)
+  summary(nn1.en, standardize=T)
+  
+    
+##Compare exchangeability across matched populations
+  
+  #Average Standardized Mean Difference-Unmatched
+  mean(abs(summary(nn1, standardize=T)$sum.all[, 3][-1])) 
+    
+    # Matching attempt #1 Logistic Regression Propensity Score
+    mean(abs(summary(nn1, standardize=T)$sum.matched[, 3][-1])) 
+
+    # Matching attempt #2 Random Forest Propensity Score
+    mean(abs(summary(nn1.rf, standardize=T)$sum.matched[, 3][-1])) 
+    
+    # Matching attempt #3 Elastic Net Propensity Score
+    mean(abs(summary(nn1.en, standardize=T)$sum.matched[, 3][-1])) 
+```
+
+More individuals "match" using RF propensity score than logistic regression, followed by Elastic Net.
+
+
+### Estimate and compare effects across algorithms
+
+```{r compare}
+
+ outcome.model.1 <- glm(lc5 ~ eversmk, data=nn1.data, family=binomial(link="logit"))
+    
+    exp(outcome.model.1$coefficients)
+        exp(confint(outcome.model.1))
+    
+ outcome.model.2 <- glm(lc5 ~ eversmk, data=nn1.data.rf, family=binomial(link="logit"))
+    
+        exp(outcome.model.2$coefficients)
+            exp(confint(outcome.model.2))
+            
+            
+ outcome.model.3 <- glm(lc5 ~ eversmk, data=nn1.data.en, family=binomial(link="logit"))
+    
+        exp(outcome.model.3$coefficients)
+            exp(confint(outcome.model.3))
+```
+
+The point estimate are similar from these three algorithms. the 95% CI: random forest < logistics < elastic net.
